@@ -9,3 +9,9 @@ data/
 .DS_Store
 **/*.log
 **/*.log.*.gz
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
