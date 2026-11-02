@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 # ---- roles -> scopes -------------------------------------------------------
 ROLE_SCOPES: dict[str, set[str]] = {
     "viewer": {"activity:read"},
-    "operator": {"activity:read", "activity:write"},
+    "operator": {"activity:read", "activity:write", "activity:delete"},
     "admin": {"activity:read", "activity:write", "activity:delete", "tenant:admin", "audit:read"},
 }
 

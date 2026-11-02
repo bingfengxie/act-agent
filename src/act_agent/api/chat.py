@@ -1,4 +1,8 @@
-"""Streaming chat endpoints (SSE)."""
+"""Streaming chat endpoints: Streamable HTTP（stateless），响应体为 SSE 事件格式。
+
+每个用户消息是一个自包含 POST：turn 结束即关闭连接，不维护跨请求的服务端会话，
+LB 可把同 session 的不同消息路由到任意 worker，状态由 Postgres checkpoint + advisory lock 恢复。
+"""
 
 from __future__ import annotations
 
@@ -6,8 +10,8 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sse_starlette.sse import EventSourceResponse
 
 from act_agent.api.common import owned_session
 from act_agent.api.schemas import MessageRequest, ResumeRequest
@@ -41,6 +45,11 @@ async def _persist(
             await update_session(db, record, status=status, title=title)
 
 
+def _sse_frame(event: str, data: str) -> str:
+    """单条 SSE 帧（Streamable HTTP 的 SSE 响应体）。"""
+    return f"event: {event}\ndata: {data}\n\n"
+
+
 async def _sse(
     *,
     record: SessionRecord,
@@ -64,12 +73,12 @@ async def _sse(
             name = event.pop("event")
             if name == "done":
                 final_status = str(event.get("status", "idle"))
-            yield {"event": name, "data": json.dumps(event, ensure_ascii=False, default=str)}
+            yield _sse_frame(name, json.dumps(event, ensure_ascii=False, default=str))
     except Exception:  # noqa: BLE001 - keep the stream well-formed on crash
         logger.exception("stream failed for session %s", record.id)
         final_status = "failed"
-        yield {"event": "error", "data": json.dumps({"message": "内部错误"}, ensure_ascii=False)}
-        yield {"event": "done", "data": json.dumps({"status": "failed"}, ensure_ascii=False)}
+        yield _sse_frame("error", json.dumps({"message": "内部错误"}, ensure_ascii=False))
+        yield _sse_frame("done", json.dumps({"status": "failed"}, ensure_ascii=False))
     finally:
         title = None
         if message and record.title == "新会话":
@@ -99,14 +108,15 @@ async def send_message(
     record = await owned_session(db, session_id, principal)
     tenant_config = await _tenant_config(db, principal.tenant_id)
     await _acquire_or_409(record)
-    return EventSourceResponse(
+    return StreamingResponse(
         _sse(
             record=record,
             principal=principal,
             tenant_config=tenant_config,
             message=body.message,
         ),
-        ping=15,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -120,12 +130,13 @@ async def resume(
     record = await owned_session(db, session_id, principal)
     tenant_config = await _tenant_config(db, principal.tenant_id)
     await _acquire_or_409(record)
-    return EventSourceResponse(
+    return StreamingResponse(
         _sse(
             record=record,
             principal=principal,
             tenant_config=tenant_config,
             resume=body.answer,
         ),
-        ping=15,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     # ---- LLM ----
     llm_provider: str = "openai"  # openai | anthropic
-    llm_model: str = "deepseek-chat"
+    llm_model: str = "deepseek-flash"
     llm_base_url: str = "https://api.deepseek.com"
     llm_api_key: str = Field(
         default="",

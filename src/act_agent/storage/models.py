@@ -81,12 +81,19 @@ class SessionRecord(Base):
 
 
 class AuditLog(Base):
-    """写操作审计：每一次 create/update/delete 工具调用都留痕。"""
+    """全方位审计：工具调用（读/写/本地）+ 用户原始输入 + 最终返回结果。
+
+    ``event_type`` 区分事件种类：
+    - ``tool_call``        工具调用（含读操作），``action`` = create/update/delete/read
+    - ``user_input``       用户原始输入（message / resume 回答），落在 ``content``
+    - ``assistant_output`` 最终返回给用户的结果，落在 ``content``
+    """
 
     __tablename__ = "audit_logs"
     __table_args__ = (
         Index("ix_audit_tenant_created", "tenant_id", "created_at"),
         Index("ix_audit_thread", "thread_id"),
+        Index("ix_audit_event_type", "event_type"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True,
@@ -95,11 +102,16 @@ class AuditLog(Base):
     user_id: Mapped[str] = mapped_column(String(64), nullable=False)
     session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    action: Mapped[str] = mapped_column(String(32), nullable=False)  # create/update/delete
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False, default="tool_call")
+    # 非 tool_call 事件用空串占位（避免 NULL：SQLite 无法 ALTER 掉 NOT NULL，空串可兼容既有库）
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # create/update/delete/read；非 tool_call 事件为空串
+    action: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     args_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     args_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)  # success/failed/...
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # success/failed/denied/cancelled/ok
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)

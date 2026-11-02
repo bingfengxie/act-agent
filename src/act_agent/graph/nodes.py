@@ -18,7 +18,6 @@ from act_agent.graph.hitl import parse_confirmation
 from act_agent.graph.normalize import normalize_tool_args
 from act_agent.graph.preview import render_preview
 from act_agent.graph.prompts import build_system_prompt
-from act_agent.storage.repository import write_audit
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +143,7 @@ async def _execute_tool(ctx: RunContext, call: dict, task_state: dict) -> ToolMe
 
     tool = ctx.tool_map.get(name)
     if tool is None:
+        await _audit(ctx, name, action, args, status="failed", error="tool not found")
         return _tool_message(call, f"错误：工具 {name} 不存在或不可用。")
 
     if not ctx.principal.has(required_scope(action)):
@@ -168,8 +168,9 @@ async def _execute_tool(ctx: RunContext, call: dict, task_state: dict) -> ToolMe
         status, error = "failed", str(exc)[:500]
 
     duration_ms = int((time.perf_counter() - started) * 1000)
+    # 全方位审计：读/写/本地工具统一留痕（不再只审计写工具）
+    await _audit(ctx, name, action, args, status=status, error=error, duration_ms=duration_ms)
     if is_write_action(action):
-        await _audit(ctx, name, action, args, status=status, error=error, duration_ms=duration_ms)
         if status == "success":
             task_state.update(stage="completed", last_result=text[:500])
             task_state.setdefault("activity_ids", [])
@@ -261,26 +262,16 @@ async def _audit(
     error: str | None = None,
     duration_ms: int = 0,
 ) -> None:
-    from act_agent.storage.db import get_session_factory
-
-    try:
-        async with get_session_factory()() as db:
-            await write_audit(
-                db,
-                tenant_id=ctx.principal.tenant_id,
-                user_id=ctx.principal.user_id,
-                session_id=ctx.session_id,
-                thread_id=ctx.thread_id,
-                tool_name=tool_name,
-                action=action,
-                args=args,
-                status=status,
-                error=error,
-                request_id=ctx.request_id,
-                duration_ms=duration_ms,
-            )
-    except Exception:  # noqa: BLE001 - audit failure must not corrupt the turn
-        logger.exception("failed to write audit log for %s", tool_name)
+    """工具审计统一走切面链（读/写/本地、deny/cancel/failed 都覆盖）。"""
+    await ctx.middleware.on_tool_call(
+        ctx,
+        tool_name=tool_name,
+        action=action,
+        args=args,
+        status=status,
+        error=error,
+        duration_ms=duration_ms,
+    )
 
 
 async def _audit_many(

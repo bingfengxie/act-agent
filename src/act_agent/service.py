@@ -16,6 +16,7 @@ from langgraph.types import Command
 from act_agent.auth.rbac import Principal, filter_tools_for_principal
 from act_agent.graph.compress import ContextCompressor
 from act_agent.graph.context import RunContext
+from act_agent.middleware import service_chain
 from act_agent.settings import Settings
 from act_agent.skills.registry import SkillRegistry
 from act_agent.skills.router import SkillRouter
@@ -64,6 +65,7 @@ class AgentService:
             session_id=session_id,
             thread_id=thread_id,
             request_id=request_id,
+            middleware=service_chain(),
         )
 
     def _config(self, ctx: RunContext, thread_id: str) -> dict:
@@ -98,6 +100,11 @@ class AgentService:
             return
 
         config = self._config(ctx, thread_id)
+        # 审计用户原始输入（message 或 resume 回答），切面内部做 PII 脱敏后落库
+        user_text = message if message is not None else resume
+        if user_text:
+            await ctx.middleware.on_user_input(ctx, user_text)
+
         graph_input = (
             {"messages": [HumanMessage(content=message)]}
             if message is not None
@@ -152,7 +159,13 @@ class AgentService:
         if not accumulated.strip():
             content = await self._last_assistant_text(config)
             if content:
-                yield {"event": "message", "content": content}
+                yield {"event": "message", "content": ctx.middleware.redact_output(content)}
+                accumulated = content
+
+        # 审计最终返回给用户的结果；切面内部脱敏落库
+        final_text = accumulated.strip()
+        if final_text:
+            await ctx.middleware.on_assistant_output(ctx, final_text)
 
         yield {"event": "done", "status": "idle"}
 

@@ -11,13 +11,15 @@
 - **上下文压缩**：保留最近 N 条 + 滚动摘要；结构化 `task_state` 永不压缩，未完成活动不会丢
 - **强制 HITL**：写操作由运行时 `interrupt()` 弹出预览，用户跨轮确认后才执行
 - **认证与权限**：JWT + 角色（viewer/operator/admin），工具级白名单 + 审计
+- **轻量切面层（middleware）**：审计与 PII 脱敏作为 I/O 边界切面挂载；HITL 与摘要保持图级实现
+- **全方位审计**：工具调用（读/写/本地）+ 用户原始输入 + 最终结果，落库前 PII 脱敏
 
 ## 架构
 
 ```
-HTTP/SSE (JWT)
+Streamable HTTP (stateless, SSE 响应体) (JWT)
    │
-FastAPI ── auth ── RBAC ── sessions ── chat(SSE)
+FastAPI ── auth ── RBAC ── sessions ── chat(Streamable HTTP)
    │
 LangGraph thread = tenant:user:conversation
    ├─ prepare  压缩上下文（摘要 + 最近 N 条）
@@ -81,7 +83,11 @@ uv run python -m act_agent.cli --username operator --password operator123
 输入层使用 `prompt_toolkit`：中文退格/光标正常（macOS 原生 `input()` 基于 libedit，中文宽字符会删不干净）；
 多行内容可直接粘贴，**Enter 发送，Option/Alt+Enter 换行**；非交互管道输入仍走兼容路径。
 
-### HTTP + SSE
+### HTTP + Streamable HTTP
+
+每个用户消息是一个自包含 POST：响应体为 SSE 事件格式，turn 结束即关闭连接，不维护跨请求的
+服务端会话，LB 可把同 session 的不同消息路由到任意 worker（状态由 Postgres checkpoint +
+advisory lock 恢复）。
 
 ```bash
 # 1. 登录
@@ -95,7 +101,7 @@ SID=$(curl -s localhost:8088/v1/sessions -X POST \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}' \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 
-# 3. 发消息（SSE）
+# 3. 发消息（Streamable HTTP，SSE 响应体）
 curl -N localhost:8088/v1/sessions/$SID/messages -X POST \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"message":"一次性创建活动：名称中秋节3，折扣，2026-8-10 到 2026-8-15，全部人群，预算1212元。商品1 门店10001 SKU1111 UPC xxxx 折扣0.7；商品2 门店10002 SKU2222 UPC yyyy 折扣0.7"}'
@@ -148,8 +154,16 @@ curl -s localhost:8088/v1/sessions/$SID/state -H "Authorization: Bearer $TOKEN" 
 curl -s "localhost:8088/v1/admin/audit?limit=20" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
-审计表记录每一次写操作（create/update/delete）的 `tenant/user/session/thread/tool/action/args/args_hash/status/error/duration`，
-包括被拒绝（denied）和被取消（cancelled）的调用。`audit:read` 权限仅 admin 拥有。
+审计表全方位留痕，按 `event_type` 区分：
+
+| event_type | 内容 | 落点 |
+| --- | --- | --- |
+| `tool_call` | 工具调用（读/写/本地，含 deny/cancel/failed） | `tool_name` + `action`(create/update/delete/read) + `args` |
+| `user_input` | 用户原始输入（message 或 resume 回答） | `content` |
+| `assistant_output` | 最终返回给用户的结果 | `content` |
+
+所有落库内容先做 PII 脱敏（手机号/身份证/邮箱/银行卡），审计表不存明文敏感信息。
+`audit:read` 权限仅 admin 拥有。
 
 ## 多租户
 
@@ -187,7 +201,7 @@ uv run python scripts/provision_tenant.py --tenant acme --username root --passwo
 | 变量 | 说明 | 默认 |
 | --- | --- | --- |
 | `ACT_AGENT_LLM_PROVIDER` | `openai` / `anthropic` | openai |
-| `ACT_AGENT_LLM_MODEL` | 模型名 | deepseek-chat |
+| `ACT_AGENT_LLM_MODEL` | 模型名 | deepseek-flash |
 | `ACT_AGENT_LLM_BASE_URL` | OpenAI 兼容地址 | https://api.deepseek.com |
 | `ACT_AGENT_LLM_API_KEY` | 未设置时回退 `DEEPSEEK_API_KEY`/`OPENAI_API_KEY` | - |
 | `ACT_AGENT_CHECKPOINT_DSN` | 留空 = InMemorySaver（仅开发） | - |
@@ -213,6 +227,8 @@ uv run ruff check src tests
 ```
 
 - `tests/unit`：HITL 解析、权限矩阵、时间补全、压缩、skill 路由与脚本执行、MCP 配置转换、JWT
+- `tests/unit/test_pii.py`：PII 脱敏规则（手机号/身份证/邮箱/银行卡、递归脱敏、切面方法）
+- `tests/unit/test_audit.py`：审计切面（事件类型映射、脱敏落库、deny/cancel、完整链路顺序、切面链组装）
 - `tests/integration/test_graph_flow.py`：脚本化 LLM + 假工具的完整图流程
   （预览 → 含糊追问 → 确认 → 执行 → 审计；取消、越权、只给日期的分支）
 - `tests/integration/test_api_auth.py`：登录、角色权限、会话隔离
@@ -228,9 +244,10 @@ uv run ruff check src tests
 ```
 src/act_agent/
 ├── main.py / runtime.py / service.py / cli.py / llm.py
-├── api/         auth, sessions, chat(SSE), admin(audit)
+├── api/         auth, sessions, chat(Streamable HTTP), admin(audit)
 ├── auth/        jwt, passwords, rbac
 ├── graph/       builder, state, nodes, prompts, compress, hitl, preview, context
+├── middleware/  base, audit, pii（轻量切面层）
 ├── skills/      registry, router, tools
 ├── mcp/         config, client
 ├── storage/     models, db, repository, checkpointer, locks, bootstrap
@@ -239,7 +256,7 @@ src/act_agent/
 
 ## 已知限制
 
-- 审计只覆盖 MCP 写工具；`skill_run_script` 等本地工具不审计
+- 增量 `token` 流不做 PII 脱敏（流式逐 token 无法可靠识别跨 token 的敏感串）；审计与最终 `message` 事件已脱敏
 - 压缩摘要质量取决于所选模型；关键参数另有 `task_state` 兜底
 - 租户级模型覆盖尚未实现（租户可覆盖 MCP 服务）
 - 单机 `InMemorySaver` 模式下重启会丢失会话状态，仅用于开发

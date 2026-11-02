@@ -17,6 +17,7 @@ router = APIRouter(prefix="/v1/admin", tags=["admin"])
 async def audit_log(
     session_id: str | None = None,
     action: str | None = None,
+    event_type: str | None = None,
     limit: int = 100,
     principal: Principal = Depends(require_scope(SCOPE_AUDIT)),
     db: AsyncSession = Depends(get_db),
@@ -26,6 +27,7 @@ async def audit_log(
         tenant_id=principal.tenant_id,
         session_id=session_id,
         action=action,
+        event_type=event_type,
         limit=min(max(limit, 1), 500),
     )
     return {
@@ -37,11 +39,13 @@ async def audit_log(
                 "session_id": e.session_id,
                 "thread_id": e.thread_id,
                 "user_id": e.user_id,
+                "event_type": e.event_type,
                 "tool_name": e.tool_name,
                 "action": e.action,
                 "status": e.status,
                 "args": e.args_json,
                 "args_hash": e.args_hash,
+                "content": e.content,
                 "error": e.error,
                 "duration_ms": e.duration_ms,
                 "request_id": e.request_id,

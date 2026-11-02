@@ -139,23 +139,29 @@ async def write_audit(
     user_id: str,
     session_id: str | None,
     thread_id: str | None,
-    tool_name: str,
-    action: str,
-    args: dict,
-    status: str,
+    event_type: str = "tool_call",
+    tool_name: str | None = None,
+    action: str | None = None,
+    args: dict | None = None,
+    content: str | None = None,
+    status: str = "ok",
     error: str | None = None,
     request_id: str | None = None,
     duration_ms: int = 0,
 ) -> AuditLog:
+    args = args or {}
+    digest_payload = args if event_type == "tool_call" else {"content": content}
     entry = AuditLog(
         tenant_id=tenant_id,
         user_id=user_id,
         session_id=session_id,
         thread_id=thread_id,
-        tool_name=tool_name,
-        action=action,
+        event_type=event_type,
+        tool_name=tool_name or "",
+        action=action or "",
         args_json=args,
-        args_hash=args_digest(args),
+        args_hash=args_digest(digest_payload),
+        content=content,
         status=status,
         error=error,
         request_id=request_id,
@@ -173,6 +179,7 @@ async def list_audit(
     tenant_id: str,
     session_id: str | None = None,
     action: str | None = None,
+    event_type: str | None = None,
     limit: int = 100,
 ) -> Sequence[AuditLog]:
     stmt = select(AuditLog).where(AuditLog.tenant_id == tenant_id)
@@ -180,6 +187,8 @@ async def list_audit(
         stmt = stmt.where(AuditLog.session_id == session_id)
     if action:
         stmt = stmt.where(AuditLog.action == action)
+    if event_type:
+        stmt = stmt.where(AuditLog.event_type == event_type)
     stmt = stmt.order_by(AuditLog.created_at.desc()).limit(limit)
     return (await db.execute(stmt)).scalars().all()
 

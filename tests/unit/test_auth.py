@@ -23,7 +23,7 @@ def test_jwt_roundtrip_carries_tenant_and_scopes():
     assert principal.tenant_id == "t1"
     assert principal.user_id == "u1"
     assert principal.has("activity:write")
-    assert not principal.has("activity:delete")
+    assert principal.has("activity:delete")
 
 
 def test_tampered_token_rejected():

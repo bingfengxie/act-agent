@@ -24,7 +24,14 @@ class RunContext:
     session_id: str
     thread_id: str
     request_id: str | None = None
+    middleware: Any = field(default=None, repr=False)
     _tool_map: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.middleware is None:
+            from act_agent.middleware import default_chain
+
+            self.middleware = default_chain()
 
     @property
     def tool_map(self) -> dict[str, Any]:
