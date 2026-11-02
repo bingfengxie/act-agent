@@ -49,6 +49,8 @@ def _ensure_audit_columns(sync_conn) -> None:
     """``create_all`` 不会给已存在的表补列；补齐 audit_logs 新增的 event_type/content。
 
     项目无 Alembic，用最小化的 ``ALTER TABLE ADD COLUMN`` 兼容已有 SQLite/Postgres 库。
+    多 worker（``--workers 2``）首次启动会并发执行本函数，check-then-ALTER 非原子，
+    因此对「列已存在」类错误做容错，避免第二个 worker 撞 duplicate column 而崩。
     """
     from sqlalchemy import inspect, text
 
@@ -56,13 +58,20 @@ def _ensure_audit_columns(sync_conn) -> None:
     if "audit_logs" not in insp.get_table_names():
         return
     existing = {c["name"] for c in insp.get_columns("audit_logs")}
+    additions = []
     if "event_type" not in existing:
-        sync_conn.execute(
-            text("ALTER TABLE audit_logs ADD COLUMN event_type VARCHAR(32) "
-                 "NOT NULL DEFAULT 'tool_call'")
+        additions.append(
+            "ALTER TABLE audit_logs ADD COLUMN event_type VARCHAR(32) "
+            "NOT NULL DEFAULT 'tool_call'"
         )
     if "content" not in existing:
-        sync_conn.execute(text("ALTER TABLE audit_logs ADD COLUMN content TEXT"))
+        additions.append("ALTER TABLE audit_logs ADD COLUMN content TEXT")
+
+    for stmt in additions:
+        try:
+            sync_conn.execute(text(stmt))
+        except Exception as exc:  # noqa: BLE001 - 并发 worker 可能已加列
+            logger.warning("audit column migration skipped: %s (%s)", stmt[:48], exc)
 
 
 async def init_db() -> None:

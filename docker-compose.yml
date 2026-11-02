@@ -26,7 +26,7 @@ services:
       ACT_AGENT_SKILLS_DIR: /app/act-skills
       ACT_AGENT_MCP_CONFIG_PATH: /app/config/mcp.json
       ACT_AGENT_LLM_PROVIDER: ${ACT_AGENT_LLM_PROVIDER:-openai}
-      ACT_AGENT_LLM_MODEL: ${ACT_AGENT_LLM_MODEL:-deepseek-chat}
+      ACT_AGENT_LLM_MODEL: ${ACT_AGENT_LLM_MODEL:-deepseek-flash}
       ACT_AGENT_LLM_BASE_URL: ${ACT_AGENT_LLM_BASE_URL:-https://api.deepseek.com}
       ACT_AGENT_LLM_API_KEY: ${ACT_AGENT_LLM_API_KEY:-}
       ACT_AGENT_JWT_SECRET: ${ACT_AGENT_JWT_SECRET:-change-me}
