@@ -49,6 +49,9 @@ class _ScriptedLLM:
         return self
 
     async def ainvoke(self, messages):
+        system = messages[0].content if messages else ""
+        if isinstance(system, str) and "活动参数抽取器" in system:
+            return AIMessage(content="{}")
         return self._responses.pop(0)
 
 

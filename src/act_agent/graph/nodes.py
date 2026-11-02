@@ -13,6 +13,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
 from act_agent.auth.rbac import classify_tool, is_write_action, required_scope
+from act_agent.graph.collect import extract_draft
 from act_agent.graph.context import RunContext, get_ctx
 from act_agent.graph.hitl import parse_confirmation
 from act_agent.graph.normalize import normalize_tool_args
@@ -60,6 +61,43 @@ async def route_node(state: dict, config: RunnableConfig) -> dict:
 
     logger.info("route: skill=%s current=%s reason=%s", skill, current_skill, decision.reason)
     return {"skill": skill, "task_state": task_state}
+
+
+# --------------------------------------------------------------------------- #
+# collect: 把用户口述固化进 task_state.draft（压缩历史也不丢「已记录」）
+# --------------------------------------------------------------------------- #
+async def collect_node(state: dict, config: RunnableConfig) -> dict:
+    ctx = get_ctx(config)
+    messages = state.get("messages", [])
+    task_state = dict(state.get("task_state") or {})
+    processed = int(task_state.get("collected_upto", 0) or 0)
+    if len(messages) <= processed:
+        return {}
+
+    task_state["collected_upto"] = len(messages)
+
+    # 上一个任务已经成功完成 → 新一轮从空草稿开始，避免旧字段串到新活动
+    if task_state.get("stage") == "completed":
+        task_state.update(
+            stage="collecting", draft={}, missing=[], corrections=[], activity_ids=[]
+        )
+
+    # 取「上次抽取之后」的全部用户消息：正常情况下只有本轮这一条；
+    # 首次升级（collected_upto 缺失）时会顺带回填历史对话里已给过的参数。
+    message = _human_texts_since(messages, processed)
+    # 确认/取消不是新参数，不触发抽取
+    if not message or parse_confirmation(message).verdict in {"confirm", "cancel"}:
+        return {"task_state": task_state}
+
+    update = await extract_draft(
+        ctx.llm,
+        skill=state.get("skill") or task_state.get("skill"),
+        task_state=task_state,
+        message=message,
+    )
+    if update is not None:
+        task_state.update(update)
+    return {"task_state": task_state}
 
 
 # --------------------------------------------------------------------------- #
@@ -197,6 +235,17 @@ def _last_human_text(messages: list) -> str:
         if isinstance(msg, HumanMessage):
             return msg.content if isinstance(msg.content, str) else str(msg.content)
     return ""
+
+
+def _human_texts_since(messages: list, processed: int) -> str:
+    """拼接上次草稿抽取之后的新用户消息（用于增量抽取/历史回填）。"""
+    parts = []
+    for msg in messages[processed:]:
+        if isinstance(msg, HumanMessage):
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if text.strip():
+                parts.append(text.strip())
+    return "\n\n".join(parts)
 
 
 def _tool_message(call: dict, content: str) -> ToolMessage:

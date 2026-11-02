@@ -43,14 +43,25 @@ ACTIVITY_ARGS = {
 
 
 class ScriptedLLM:
-    def __init__(self, responses):
+    def __init__(self, responses, draft_responses=None):
         self._responses = list(responses)
+        self._draft_responses = list(draft_responses or [])
         self.calls = 0
+        self.draft_calls = 0
+        self.agent_prompts: list[str] = []
 
     def bind_tools(self, tools):
         return self
 
     async def ainvoke(self, messages):
+        system = messages[0].content if messages else ""
+        if isinstance(system, str) and "活动参数抽取器" in system:
+            self.draft_calls += 1
+            if self._draft_responses:
+                return AIMessage(content=self._draft_responses.pop(0))
+            return AIMessage(content="{}")
+        if isinstance(system, str):
+            self.agent_prompts.append(system)
         self.calls += 1
         if not self._responses:
             return AIMessage(content="（无更多脚本）")
@@ -84,11 +95,11 @@ def _principal(roles=("operator",)) -> Principal:
     )
 
 
-def _build(settings, principal, responses):
+def _build(settings, principal, responses, draft_responses=None):
     registry = SkillRegistry(settings.resolved_skills_dir)
     registry.discover()
     tool = FakeWriteTool()
-    llm = ScriptedLLM(responses)
+    llm = ScriptedLLM(responses, draft_responses)
     ctx = RunContext(
         principal=principal,
         tools=[tool],
@@ -102,7 +113,7 @@ def _build(settings, principal, responses):
     )
     graph = build_graph(InMemorySaver())
     config = {"configurable": {"thread_id": "thread-1", "ctx": ctx}, "recursion_limit": 20}
-    return graph, tool, config
+    return graph, tool, config, llm
 
 
 async def _interrupts(graph, config, inp):
@@ -122,7 +133,7 @@ async def test_preview_then_confirm_creates_activity(settings):
         ),
         AIMessage(content="已创建大活动 中秋节3（ID 99），包含 2 个商品活动。"),
     ]
-    graph, tool, config = _build(settings, _principal(), llm_responses)
+    graph, tool, config, llm = _build(settings, _principal(), llm_responses)
 
     interrupts = await _interrupts(
         graph, config,
@@ -161,7 +172,7 @@ async def test_ambiguous_reply_asks_clarification_once(settings):
                                            "args": ACTIVITY_ARGS, "id": "call_1"}]),
         AIMessage(content="已创建。"),
     ]
-    graph, tool, config = _build(settings, _principal(), responses)
+    graph, tool, config, llm = _build(settings, _principal(), responses)
 
     first = await _interrupts(
         graph, config, {"messages": [HumanMessage(content="一次性创建中秋节3活动")]}
@@ -187,7 +198,7 @@ async def test_cancel_writes_nothing(settings):
                                            "args": ACTIVITY_ARGS, "id": "call_1"}]),
         AIMessage(content="已取消，未写入任何数据。"),
     ]
-    graph, tool, config = _build(settings, _principal(), responses)
+    graph, tool, config, llm = _build(settings, _principal(), responses)
 
     await _interrupts(graph, config, {"messages": [HumanMessage(content="一次性创建活动")]})
     await _interrupts(graph, config, Command(resume="取消"))
@@ -209,7 +220,7 @@ async def test_viewer_cannot_execute_write_tool(settings):
         AIMessage(content="权限不足。"),
     ]
     viewer = Principal("u2", "t1", ("viewer",), frozenset({"activity:read"}))
-    graph, tool, config = _build(settings, viewer, responses)
+    graph, tool, config, llm = _build(settings, viewer, responses)
 
     await _interrupts(graph, config, {"messages": [HumanMessage(content="一次性创建活动")]})
     await _interrupts(graph, config, Command(resume="确认创建 中秋节3"))
@@ -228,7 +239,7 @@ async def test_date_only_times_are_normalized_before_preview_and_execution(setti
                                            "args": date_only_args, "id": "call_1"}]),
         AIMessage(content="已创建。"),
     ]
-    graph, tool, config = _build(settings, _principal(), responses)
+    graph, tool, config, llm = _build(settings, _principal(), responses)
 
     interrupts = await _interrupts(
         graph, config, {"messages": [HumanMessage(content="一次性创建中秋节3活动")]}
@@ -248,8 +259,54 @@ async def test_vague_answers_never_write(settings, answer):
                                            "args": ACTIVITY_ARGS, "id": "call_1"}]),
         AIMessage(content="请明确确认。"),
     ]
-    graph, tool, config = _build(settings, _principal(), responses)
+    graph, tool, config, llm = _build(settings, _principal(), responses)
     await _interrupts(graph, config, {"messages": [HumanMessage(content="一次性创建活动")]})
     clarify = await _interrupts(graph, config, Command(resume=answer))
     assert clarify and clarify[0]["type"] == "clarify"
     assert tool.calls == []
+
+
+async def test_draft_is_collected_merged_and_injected(settings):
+    """「已记录」字段落到 task_state.draft，并随 system prompt 注入，压缩历史也不会丢。"""
+    responses = [
+        AIMessage(content="还需要补充开始时间、结束时间、活动人群、预算和商品活动。"),
+        AIMessage(content="信息已齐全。"),
+    ]
+    draft_responses = [
+        '{"name": "中秋节11", "actType": "折扣"}',
+        '{"startTime": "2026-09-20", "endTime": "2026-09-25", '
+        '"audienceScope": "全部用户", "budget": "5000", "products": [{"poiId": "10001"}]}',
+    ]
+    graph, tool, config, llm = _build(
+        settings, _principal(), responses, draft_responses=draft_responses
+    )
+
+    await _interrupts(
+        graph, config,
+        {"messages": [HumanMessage(
+            content="一次性创建 1 个大活动 + 多个商品活动：活动名称：中秋节11，活动类型：折扣"
+        )]},
+    )
+
+    state = (await graph.aget_state(config)).values
+    assert state["task_state"]["draft"] == {"name": "中秋节11", "actType": 2}
+    assert state["task_state"]["missing"] == [
+        "startTime", "endTime", "audienceScope", "budget", "products"
+    ]
+    # 第二轮 system prompt 里能直接看到已记录字段（不依赖原始对话还在窗口里）
+    assert "中秋节11" in llm.agent_prompts[-1]
+
+    await _interrupts(
+        graph, config,
+        {"messages": [HumanMessage(
+            content="开始 2026-09-20，结束 2026-09-25，全部用户，预算 5000，商品 poiId 10001"
+        )]},
+    )
+
+    state = (await graph.aget_state(config)).values
+    draft = state["task_state"]["draft"]
+    assert draft["name"] == "中秋节11" and draft["actType"] == 2  # 旧字段保留
+    assert draft["startTime"] == "2026-09-20"
+    assert draft["budget"] == 5000
+    assert draft["products"] == [{"poiId": 10001}]
+    assert state["task_state"]["missing"] == []

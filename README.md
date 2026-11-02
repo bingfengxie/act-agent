@@ -24,6 +24,7 @@ FastAPI ── auth ── RBAC ── sessions ── chat(Streamable HTTP)
 LangGraph thread = tenant:user:conversation
    ├─ prepare  压缩上下文（摘要 + 最近 N 条）
    ├─ route    选 skill（关键词 → LLM 兜底）
+   ├─ collect  抽取已收集参数 → task_state.draft（新建类任务）
    ├─ agent    LLM + MCP 工具 + skill 指令
    └─ tools    权限 → interrupt 预览 → 执行 → 审计
    │
