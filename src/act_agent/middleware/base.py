@@ -6,8 +6,9 @@
   （跨 worker 恢复「待确认」状态）。LangChain 的 ``HumanInTheLoopMiddleware`` 工作在
   模型/工具调用边界（``ToolCallRequest``），承载不了这里的「预览卡片 + confirm/clarify/cancel
   状态机 + 跨轮恢复」，因此 HITL 保持图级实现（见 ``graph/nodes.py``）。
-- **摘要** 依赖 graph state 的 ``summary_upto`` 分割点与 ``task_state`` 全量注入，是状态管理
-  而非模型 I/O，因此保持图级实现（见 ``graph/compress.py`` + ``graph/nodes.prepare_node``）。
+- **摘要** 要真正删除 graph state 里已摘要的消息（``RemoveMessage``），并同步修正
+  ``task_state.collected_upto`` 游标；这是状态管理而非模型 I/O，因此保持图级实现
+  （见 ``graph/compress.py`` + ``graph/nodes.compact_node``）。
 
 这里只承载真正属于 I/O 边界的能力：**审计（全事件）** 与 **PII 脱敏**。
 """

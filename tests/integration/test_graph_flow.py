@@ -310,3 +310,24 @@ async def test_draft_is_collected_merged_and_injected(settings):
     assert draft["budget"] == 5000
     assert draft["products"] == [{"poiId": 10001}]
     assert state["task_state"]["missing"] == []
+
+
+async def test_messages_stay_bounded_across_turns(settings):
+    """破坏性压缩：多轮之后 state.messages 仍只保留最近的尾巴。"""
+    tiny = settings.model_copy(
+        update={"max_context_tokens": 40, "compress_ratio": 0.5, "keep_recent_messages": 2}
+    )
+    responses = [AIMessage(content=f"回复{i}") for i in range(6)]
+    graph, tool, config, llm = _build(tiny, _principal(), responses)
+
+    for i in range(5):
+        await _interrupts(
+            graph, config,
+            {"messages": [HumanMessage(content=f"第{i}轮，说一段足够长的话触发压缩")]},
+        )
+        values = (await graph.aget_state(config)).values
+        assert len(values["messages"]) <= 4
+
+    values = (await graph.aget_state(config)).values
+    assert values["summary"]  # 被删掉的前缀已折进摘要
+    assert values["messages"][-1].content == "回复4"

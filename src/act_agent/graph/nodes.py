@@ -1,4 +1,4 @@
-"""Graph nodes: prepare -> route -> agent -> (tools -> agent)*"""
+"""Graph nodes: route -> collect -> compact -> agent -> (tools -> compact -> agent)*"""
 
 from __future__ import annotations
 
@@ -8,8 +8,15 @@ import logging
 import time
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.runnables import RunnableConfig
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import interrupt
 
 from act_agent.auth.rbac import classify_tool, is_write_action, required_scope
@@ -26,17 +33,35 @@ MAX_TOOL_OUTPUT_CHARS = 12_000
 
 
 # --------------------------------------------------------------------------- #
-# prepare: compress context
+# compact: 破坏性压缩（摘要 + 从 state 删除已摘要的前缀）
 # --------------------------------------------------------------------------- #
-async def prepare_node(state: dict, config: RunnableConfig) -> dict:
+async def compact_node(state: dict, config: RunnableConfig) -> dict:
+    """把更早的消息折进摘要后从 state 中真正删除，保证 ``messages`` 有界。
+
+    放在 collect 之后、agent 之前，并挂在 tools 之后，确保每一次模型调用前
+    都结算一次：轮内新增的工具结果会立刻计入预算、旧轮次按需压缩；当前轮
+    自身超窗则由 ``agent_node`` 里的 ``fit_view`` 兜底。HITL resume 同样覆盖。
+    """
     ctx = get_ctx(config)
-    messages = state.get("messages", [])
-    summary, summary_upto = await ctx.compressor.prepare(
-        messages,
-        state.get("summary", ""),
-        int(state.get("summary_upto", 0) or 0),
-    )
-    return {"summary": summary, "summary_upto": summary_upto}
+    messages = list(state.get("messages", []))
+    summary, split = await ctx.compressor.compact(messages, state.get("summary", ""))
+    if split <= 0:
+        return {}
+
+    tail = messages[split:]
+    task_state = dict(state.get("task_state") or {})
+    processed = int(task_state.get("collected_upto", 0) or 0)
+    if processed:
+        # collected_upto 是 messages 的下标：前缀被删后必须同步回退，
+        # 否则 collect 会误以为本轮用户消息已经抽取过。
+        task_state["collected_upto"] = max(0, processed - split)
+
+    logger.info("compacted %d messages, kept %d", split, len(tail))
+    return {
+        "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *tail],
+        "summary": summary,
+        "task_state": task_state,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -113,8 +138,9 @@ async def agent_node(state: dict, config: RunnableConfig) -> dict:
         summary=state.get("summary", ""),
         principal=ctx.principal,
     )
-    split = int(state.get("summary_upto", 0) or 0)
-    history = list(state.get("messages", []))[split:]
+    # 压缩是破坏性的：state.messages 已经是有界尾巴；fit_view 只兜底
+    # “当前轮自身就超窗”（多个超大并行工具结果）的极端情况。
+    history = ctx.compressor.fit_view(list(state.get("messages", [])))
 
     model = ctx.llm.bind_tools(ctx.tools) if ctx.tools else ctx.llm
     response = await model.ainvoke([SystemMessage(system_prompt), *history])

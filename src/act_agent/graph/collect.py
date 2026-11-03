@@ -1,8 +1,9 @@
 """Structured draft collection: 把用户口述转成可持久化、可注入的 ``task_state.draft``。
 
-为什么需要它：会话历史会被压缩（``summary_upto`` 前移），只靠 ``messages`` 记忆的
-「已记录」字段会丢。``task_state`` 每轮完整注入 system prompt，且随 checkpoint 落库，
-因此把已收集参数固化到 ``task_state.draft`` 后，跨轮、跨 worker、压缩后都不会丢。
+为什么需要它：压缩是破坏性的（已摘要的消息会从 ``messages`` 中真正删除），只靠
+``messages`` 记忆的「已记录」字段会丢。``task_state`` 每轮完整注入 system prompt，
+且随 checkpoint 落库，因此把已收集参数固化到 ``task_state.draft`` 后，跨轮、跨 worker、
+压缩后都不会丢。
 
 抽取策略：本轮用户消息 + 已有 draft → 一次轻量 LLM 调用（严格 JSON）→ 增量合并。
 只合并用户本轮明确给出/修正的字段，未提到的字段保持原值；``missing`` 由必填表确定性计算。

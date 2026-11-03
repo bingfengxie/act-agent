@@ -8,7 +8,7 @@
 - **组合创建 / 编辑 / 删除活动**：复用 `../act-skills` 下 4 个 skill（含 HITL 状态机）
 - **多租户**：tenant 隔离到会话、checkpoint、MCP 凭据、审计
 - **分布式会话**：LangGraph checkpoint 落 Postgres，任意 worker 都能恢复并继续
-- **上下文压缩**：保留最近 N 条 + 滚动摘要；结构化 `task_state` 永不压缩，未完成活动不会丢
+- **上下文压缩（破坏性）**：更早的对话折进滚动摘要后从 state 删除，`messages` 有界；结构化 `task_state` 永不压缩，未完成活动不会丢
 - **强制 HITL**：写操作由运行时 `interrupt()` 弹出预览，用户跨轮确认后才执行
 - **认证与权限**：JWT + 角色（viewer/operator/admin），工具级白名单 + 审计
 - **轻量切面层（middleware）**：审计与 PII 脱敏作为 I/O 边界切面挂载；HITL 与摘要保持图级实现
@@ -22,11 +22,12 @@ Streamable HTTP (stateless, SSE 响应体) (JWT)
 FastAPI ── auth ── RBAC ── sessions ── chat(Streamable HTTP)
    │
 LangGraph thread = tenant:user:conversation
-   ├─ prepare  压缩上下文（摘要 + 最近 N 条）
    ├─ route    选 skill（关键词 → LLM 兜底）
    ├─ collect  抽取已收集参数 → task_state.draft（新建类任务）
+   ├─ compact  破坏性压缩（摘要 + 删除已摘要前缀）
    ├─ agent    LLM + MCP 工具 + skill 指令
    └─ tools    权限 → interrupt 预览 → 执行 → 审计
+        └─ tools → compact → agent（每次模型调用前都重新结算预算）
    │
    ├── Postgres: checkpoint / sessions / tenants / users / audit
    ├── act-skills（只读，渐进加载）
@@ -177,12 +178,19 @@ curl -s "localhost:8088/v1/admin/audit?limit=20" -H "Authorization: Bearer $TOKE
 uv run python scripts/provision_tenant.py --tenant acme --username root --password secret123
 ```
 
-## 上下文压缩
+## 上下文压缩（破坏性）
 
 触发：估算 token 超过 `MAX_CONTEXT_TOKENS * COMPRESS_RATIO`，或消息数超过 `KEEP_RECENT_MESSAGES * 2`。
 
-- 更早消息交给 LLM 生成**增量摘要**（summary），只把摘要塞进 system prompt
-- 完整历史始终保留在 checkpoint（审计与 interrupt 重放需要）
+- 更早消息交给 LLM 生成**增量摘要**（summary），随后用 `RemoveMessage(REMOVE_ALL_MESSAGES)`
+  把「摘要 + 保留的尾巴」写回 state——**已摘要的消息从 state 中真正删除**
+- 因此 `messages` 有界（≈ 最近 N 条 + 当前轮），checkpoint 写入量不再随会话长度二次增长；
+  旧 checkpoint 版本仍保留历史，审计另有独立审计表
+- `compact` 同时挂在 `collect → agent` 入口和 `tools → agent` 回路上：轮内工具结果膨胀、
+  HITL resume 路径都会在每次模型调用前重新结算预算
+- 压缩时同步回退 `task_state.collected_upto`（它也是 `messages` 下标），避免漏抽取
+- 绝不压掉当前轮的 `HumanMessage`；若当前轮自身超窗，`fit_view` 只在模型视图里截断超长
+  工具结果，不改 state
 - `task_state` 结构化保存进行中的活动草稿、缺失字段、修正记录、HITL 阶段，**每轮全量注入**，
   因此 40 轮后仍能准确续建同一活动
 - 摘要失败时降级为「旧摘要 + 截断片段」，不会打断对话

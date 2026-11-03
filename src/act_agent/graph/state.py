@@ -27,8 +27,7 @@ class TaskState(TypedDict, total=False):
 
 
 class AgentState(TypedDict, total=False):
-    messages: Annotated[list[AnyMessage], add_messages]
+    messages: Annotated[list[AnyMessage], add_messages]  # 有界：已摘要前缀会被真正删除
     summary: str                          # 更早消息的滚动摘要
-    summary_upto: int                     # 已摘要到哪条；模型只看 messages[summary_upto:]
     task_state: TaskState
     skill: str | None

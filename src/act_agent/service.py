@@ -216,7 +216,6 @@ class AgentService:
             "thread_id": thread_id,
             "messages": messages,
             "summary": values.get("summary", ""),
-            "summary_upto": values.get("summary_upto", 0),
             "task_state": values.get("task_state", {}),
             "skill": values.get("skill"),
             "pending_interrupt": pending,

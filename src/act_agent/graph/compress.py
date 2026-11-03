@@ -1,9 +1,19 @@
-"""Non-destructive context compression.
+"""Destructive context compaction.
 
-Full history stays in the checkpoint (audit + interrupt replay need it). Only the
-view sent to the model is trimmed: a rolling summary of older turns + the last N
-messages. Structured `task_state` is injected separately and is never summarised,
-so an in-progress activity survives any amount of compression.
+Older turns are folded into a rolling summary and then **removed** from graph
+state, so ``messages`` stays bounded by ``keep_recent_messages`` (plus the
+current turn). This is what keeps checkpoint writes, memory and the state
+projection from growing with session length.
+
+Nothing is lost that the runtime actually needs:
+
+- audit is persisted separately (``middleware/audit.py``);
+- replay only needs the messages around a pending interrupt, which are always
+  in the retained tail;
+- collected activity parameters live in ``task_state.draft``, never in history.
+
+Older *checkpoints* still contain the pre-compaction state, so time-travel to
+an earlier turn remains possible until those checkpoint versions are pruned.
 """
 
 from __future__ import annotations
@@ -43,41 +53,114 @@ class ContextCompressor:
         self.llm = llm
         self.settings = settings
 
-    def needs_compression(self, messages: list) -> bool:
+    def needs_compaction(self, messages: list) -> bool:
         if messages_tokens(messages) >= self.settings.compression_threshold:
             return True
         return len(messages) > self.settings.keep_recent_messages * 2
 
-    async def prepare(self, messages: list, summary: str, summary_upto: int) -> tuple[str, int]:
-        """Return (summary, split_index). The model only sees messages[split_index:]."""
-        if not self.needs_compression(messages):
-            return summary, summary_upto
+    async def compact(self, messages: list, summary: str) -> tuple[str, int]:
+        """Return ``(summary, split)``; the caller replaces messages with ``messages[split:]``.
+
+        ``split == 0`` means nothing to do.
+        """
+        if not self.needs_compaction(messages):
+            return summary, 0
 
         split = self._split_index(messages)
-        if split <= summary_upto:
-            return summary, summary_upto
+        if split <= 0:
+            return summary, 0
 
-        older = messages[summary_upto:split]
+        older = messages[:split]
         new_summary = await self._summarize(summary, older)
         logger.info(
-            "compressed %d messages into summary (%d -> %d chars)",
+            "compacted %d messages into summary (%d -> %d chars)",
             len(older),
             len(summary),
             len(new_summary),
         )
         return new_summary, split
 
+    def fit_view(self, messages: list, budget_tokens: int | None = None) -> list:
+        """Last-resort view trimming, without mutating state.
+
+        Compaction already bounds normal turns. This only fires when the current
+        turn alone exceeds the model window (e.g. several huge parallel tool
+        results): oversized tool contents are shortened in the view only — the
+        full result stays in state/checkpoint.
+        """
+        budget = budget_tokens if budget_tokens is not None else self.settings.max_context_tokens
+        total = messages_tokens(messages)
+        if total <= budget:
+            return messages
+
+        tool_idx = [
+            i
+            for i, msg in enumerate(messages)
+            if isinstance(msg, ToolMessage) and isinstance(msg.content, str) and msg.content
+        ]
+        if not tool_idx:
+            logger.warning("context over budget (%d > %d) with no tool output to trim", total, budget)
+            return messages
+
+        tool_set = set(tool_idx)
+        rest = messages_tokens([m for i, m in enumerate(messages) if i not in tool_set])
+        per_message = max(200, max(budget - rest, 0) // len(tool_idx))
+        # 中文按 1.5 token/字保守换算；ASCII 会被截得更狠，但只在兜底路径上发生
+        target_chars = max(240, int(per_message / 1.5))
+
+        result = list(messages)
+        for i in tool_idx:
+            msg = result[i]
+            if len(msg.content) > target_chars:
+                head = target_chars // 2
+                tail = target_chars - head
+                result[i] = msg.model_copy(
+                    update={
+                        "content": (
+                            f"{msg.content[:head]}\n"
+                            f"…[结果过长，已省略 {len(msg.content) - target_chars} 字符]…\n"
+                            f"{msg.content[-tail:]}"
+                        )
+                    }
+                )
+        if messages_tokens(result) > budget:
+            logger.warning("context still over budget after view trimming")
+        return result
+
     def _split_index(self, messages: list) -> int:
-        keep = self.settings.keep_recent_messages
-        idx = max(0, len(messages) - keep)
+        """How many leading messages to fold into the summary.
+
+        Keeps at most ``keep_recent_messages``, but never drops the current
+        turn's ``HumanMessage`` (index ``h``): the split must satisfy
+        ``idx <= h``. If the retained tail (older turns + the current turn) is
+        still over budget, the split moves forward towards ``h`` to drop more
+        of the older turns. If the current turn alone still exceeds the model
+        window, ``fit_view`` shortens oversized tool results in the view
+        without touching state.
+        """
+        n = len(messages)
+        turn_start = self._current_turn_start(messages)
+        idx = min(turn_start, max(0, n - self.settings.keep_recent_messages))
+        idx = min(self._advance_past_tools(messages, idx), turn_start)
+
+        budget = self.settings.compression_threshold
+        while idx < turn_start and messages_tokens(messages[idx:]) > budget:
+            idx = min(self._advance_past_tools(messages, idx + 1), turn_start)
+        return idx
+
+    @staticmethod
+    def _current_turn_start(messages: list) -> int:
+        """Index of the last HumanMessage: the current turn must stay verbatim."""
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                return i
+        return 0
+
+    @staticmethod
+    def _advance_past_tools(messages: list, idx: int) -> int:
         # 不能从 ToolMessage 开始，否则会丢失与之配对的 tool_call
         while idx < len(messages) and isinstance(messages[idx], ToolMessage):
             idx += 1
-        if idx >= len(messages):
-            # 全部剩余都是 tool 结果时，回退到最后一轮对话起点，保证模型至少看到一条消息
-            idx = max(0, len(messages) - 1)
-            while idx > 0 and isinstance(messages[idx], ToolMessage):
-                idx -= 1
         return idx
 
     async def _summarize(self, previous: str, older: list) -> str:
